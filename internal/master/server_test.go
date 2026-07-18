@@ -133,3 +133,132 @@ func TestProbeReturnsUnprocessableWhenSelectionDoesNotMatch(t *testing.T) {
 		t.Fatalf("status=%d", response.StatusCode)
 	}
 }
+
+func TestBatchProbeReturnsSummariesAndLazyTargetDetails(t *testing.T) {
+	t.Parallel()
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		var task AgentTaskRequest
+		if err := json.NewDecoder(request.Body).Decode(&task); err != nil {
+			t.Errorf("decode task: %v", err)
+		}
+		available := task.Target != "down.example.com"
+		_ = json.NewEncoder(w).Encode(AgentTaskResponse{
+			Version: "v1", TaskID: task.TaskID, Type: task.Type, Target: task.Target, Status: "completed",
+			Result: ProbeResult{NormalizedTarget: task.Target, Available: available, DNS: DNSResult{Addresses: []string{"127.0.0.1"}}},
+		})
+	}))
+	defer agent.Close()
+	agentURL, _ := url.Parse(agent.URL)
+	agentHost, agentPortText, _ := net.SplitHostPort(agentURL.Host)
+	agentPort, _ := strconv.Atoi(agentPortText)
+
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"nodes": []Node{{ID: "agent-1", IP: agentHost, Port: agentPort, Status: "enabled"}}})
+	}))
+	defer registry.Close()
+
+	cfg := baseTestConfig()
+	cfg.AgentPort = agentPort
+	cfg.RegistryURL = registry.URL
+	server := httptest.NewServer(NewHandler(cfg, log.New(io.Discard, "", 0)))
+	defer server.Close()
+
+	body := bytes.NewBufferString(`{"targets":["up.example.com","down.example.com"],"options":{"timeoutMs":1500,"ports":[80,443]}}`)
+	response, err := http.Post(server.URL+"/api/v1/probes/batch", "application/json", body)
+	if err != nil {
+		t.Fatalf("POST batch: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		content, _ := io.ReadAll(response.Body)
+		t.Fatalf("status=%d body=%s", response.StatusCode, content)
+	}
+	var batch BatchProbeResponse
+	if err := json.NewDecoder(response.Body).Decode(&batch); err != nil {
+		t.Fatalf("decode batch response: %v", err)
+	}
+	if batch.Status != "running" || batch.BatchTaskID == "" {
+		t.Fatalf("unexpected initial batch response: %+v", batch)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for batch.Status != "completed" {
+		if time.Now().After(deadline) {
+			t.Fatalf("batch did not complete: %+v", batch)
+		}
+		time.Sleep(10 * time.Millisecond)
+		summaryResponse, getErr := http.Get(fmt.Sprintf("%s/api/v1/probes/batch/%s", server.URL, batch.BatchTaskID))
+		if getErr != nil {
+			t.Fatalf("GET batch summary: %v", getErr)
+		}
+		if summaryResponse.StatusCode != http.StatusOK {
+			content, _ := io.ReadAll(summaryResponse.Body)
+			summaryResponse.Body.Close()
+			t.Fatalf("summary status=%d body=%s", summaryResponse.StatusCode, content)
+		}
+		if err := json.NewDecoder(summaryResponse.Body).Decode(&batch); err != nil {
+			summaryResponse.Body.Close()
+			t.Fatalf("decode batch summary: %v", err)
+		}
+		summaryResponse.Body.Close()
+	}
+	if batch.Summary.TotalTargets != 2 || batch.Summary.AvailableTargets != 1 || batch.Summary.TotalNodeChecks != 2 {
+		t.Fatalf("unexpected batch summary: %+v", batch.Summary)
+	}
+	if batch.Progress != 100 {
+		t.Fatalf("unexpected completed progress: %d", batch.Progress)
+	}
+	if len(batch.Targets) != 2 || batch.Targets[0].Target != "up.example.com" || batch.Targets[1].Target != "down.example.com" {
+		t.Fatalf("unexpected target summaries: %+v", batch.Targets)
+	}
+
+	detailResponse, err := http.Get(fmt.Sprintf("%s/api/v1/probes/batch/%s/targets/0", server.URL, batch.BatchTaskID))
+	if err != nil {
+		t.Fatalf("GET batch target: %v", err)
+	}
+	defer detailResponse.Body.Close()
+	if detailResponse.StatusCode != http.StatusOK {
+		content, _ := io.ReadAll(detailResponse.Body)
+		t.Fatalf("detail status=%d body=%s", detailResponse.StatusCode, content)
+	}
+	var detail ProbeResponse
+	if err := json.NewDecoder(detailResponse.Body).Decode(&detail); err != nil {
+		t.Fatalf("decode batch detail: %v", err)
+	}
+	if detail.Target != "up.example.com" || len(detail.Results) != 1 || detail.Results[0].Response == nil {
+		t.Fatalf("unexpected target detail: %+v", detail)
+	}
+
+	missingResponse, err := http.Get(fmt.Sprintf("%s/api/v1/probes/batch/%s/targets/99", server.URL, batch.BatchTaskID))
+	if err != nil {
+		t.Fatalf("GET missing batch target: %v", err)
+	}
+	defer missingResponse.Body.Close()
+	if missingResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing detail status=%d", missingResponse.StatusCode)
+	}
+}
+
+func TestBatchProbeRejectsMoreThanTwoHundredTargets(t *testing.T) {
+	t.Parallel()
+	targets := make([]string, maxBatchTargets+1)
+	for index := range targets {
+		targets[index] = fmt.Sprintf("target-%d.example.com", index)
+	}
+	payload, err := json.Marshal(BatchProbeRequest{Targets: targets})
+	if err != nil {
+		t.Fatalf("encode batch: %v", err)
+	}
+	cfg := baseTestConfig()
+	server := httptest.NewServer(NewHandler(cfg, log.New(io.Discard, "", 0)))
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/api/v1/probes/batch", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("POST oversized batch: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d", response.StatusCode)
+	}
+}

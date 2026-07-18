@@ -41,6 +41,29 @@ curl -X POST http://127.0.0.1:8001/api/v1/probes \
 | `TASK_MAX_TIMEOUT` | `30s` | Web 可指定的最大探测超时 |
 | `CORS_ALLOWED_ORIGIN` | `*` | Web 跨域来源；生产环境建议设置成实际域名 |
 
+## 批量检测与数据收敛
+
+批量接口最多接收 200 个目标，并限制单个任务展开后不超过 20,000 次节点检测。Master 最多并行处理 10 个目标，实际 Agent 请求并发仍受 `MASTER_MAX_PARALLEL` 统一限制。
+
+- `POST /api/v1/probes/batch`：提交后台批量任务并返回 `202 Accepted`、任务 ID 和初始状态，不等待所有节点完成。
+- `GET /api/v1/probes/batch/{batchTaskId}`：读取任务状态、真实目标进度和目标级汇总；前端轮询到 `status=completed` 后进入结果页。
+- `GET /api/v1/probes/batch/{batchTaskId}/targets/{targetIndex}`：按需读取一个目标的完整节点明细。
+
+完整明细保存在 Master 内存中 30 分钟，最多保留最近 10 个批量任务；服务重启后失效。前端因此可以先分页展示轻量汇总，用户展开目标时再加载详细结果。
+
+请求示例：
+
+```json
+{
+  "targets": ["https://example.com", "1.1.1.1"],
+  "nodeIds": ["6a4e19c4b4f2bd88d47efb22"],
+  "options": {
+    "timeoutMs": 10000,
+    "ports": [80, 443]
+  }
+}
+```
+
 ## API
 
 ### `GET /api/v1/nodes`
