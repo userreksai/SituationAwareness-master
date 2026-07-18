@@ -107,3 +107,43 @@ type ProbeResponse struct {
 	Summary    ProbeSummary      `json:"summary"`
 	Results    []NodeProbeResult `json:"results"`
 }
+
+type BatchProbeRequest struct {
+	Targets []string     `json:"targets"`
+	NodeIDs []string     `json:"nodeIds,omitempty"`
+	Options ProbeOptions `json:"options"`
+}
+
+type BatchTargetSummary struct {
+	Index      int          `json:"index"`
+	TaskID     string       `json:"taskId"`
+	Target     string       `json:"target"`
+	Status     string       `json:"status"`
+	DurationMS int64        `json:"durationMs"`
+	Summary    ProbeSummary `json:"summary"`
+}
+
+type BatchProbeSummary struct {
+	TotalTargets        int `json:"totalTargets"`
+	CompletedTargets    int `json:"completedTargets"`
+	FailedTargets       int `json:"failedTargets"`
+	AvailableTargets    int `json:"availableTargets"`
+	TotalNodeChecks     int `json:"totalNodeChecks"`
+	AvailableNodeChecks int `json:"availableNodeChecks"`
+}
+
+// BatchProbeResponse intentionally contains target-level summaries only.
+// Node-level details are retained by Master and fetched on demand per target.
+type BatchProbeResponse struct {
+	BatchTaskID string               `json:"batchTaskId"`
+	Status      string               `json:"status"`
+	Progress    int                  `json:"progress"`
+	Error       string               `json:"error,omitempty"`
+	StartedAt   time.Time            `json:"startedAt"`
+	FinishedAt  time.Time            `json:"finishedAt"`
+	ExpiresAt   time.Time            `json:"expiresAt"`
+	DurationMS  int64                `json:"durationMs"`
+	NodeCount   int                  `json:"nodeCount"`
+	Summary     BatchProbeSummary    `json:"summary"`
+	Targets     []BatchTargetSummary `json:"targets"`
+}

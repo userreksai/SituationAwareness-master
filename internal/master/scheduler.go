@@ -18,13 +18,34 @@ import (
 	"time"
 )
 
-var ErrNoEligibleNodes = errors.New("no eligible agent nodes")
+var (
+	ErrNoEligibleNodes = errors.New("no eligible agent nodes")
+	ErrBatchNotFound   = errors.New("batch task not found or expired")
+	ErrBatchTarget     = errors.New("batch target not found")
+	ErrBatchCapacity   = errors.New("too many batch tasks are still running")
+)
+
+const (
+	maxBatchTargets    = 200
+	maxBatchNodeChecks = 20000
+	maxStoredBatches   = 10
+	batchTargetWorkers = 10
+	batchResultTTL     = 30 * time.Minute
+	batchRuntimeLimit  = 30 * time.Minute
+)
+
+type storedBatchResult struct {
+	response BatchProbeResponse
+	details  []ProbeResponse
+}
 
 type service struct {
 	cfg       Config
 	registry  *registryClient
 	agentHTTP *http.Client
 	semaphore chan struct{}
+	batchMu   sync.RWMutex
+	batches   map[string]storedBatchResult
 }
 
 func newService(cfg Config) *service {
@@ -42,6 +63,7 @@ func newService(cfg Config) *service {
 		registry:  newRegistryClient(cfg),
 		agentHTTP: &http.Client{Transport: transport},
 		semaphore: make(chan struct{}, cfg.MaxParallel),
+		batches:   make(map[string]storedBatchResult),
 	}
 }
 
@@ -65,9 +87,11 @@ func (service *service) run(ctx context.Context, request ProbeRequest) (ProbeRes
 	if len(nodes) == 0 {
 		return ProbeResponse{}, ErrNoEligibleNodes
 	}
+	return service.runWithNodes(ctx, request, nodes, newTaskID()), nil
+}
 
+func (service *service) runWithNodes(ctx context.Context, request ProbeRequest, nodes []Node, taskID string) ProbeResponse {
 	started := time.Now().UTC()
-	taskID := newTaskID()
 	results := make([]NodeProbeResult, len(nodes))
 	var wg sync.WaitGroup
 	for index, node := range nodes {
@@ -106,7 +130,230 @@ func (service *service) run(ctx context.Context, request ProbeRequest) (ProbeRes
 			response.Summary.Failed++
 		}
 	}
+	return response
+}
+
+func (service *service) startBatch(ctx context.Context, request BatchProbeRequest) (BatchProbeResponse, error) {
+	if len(request.Targets) == 0 {
+		return BatchProbeResponse{}, fmt.Errorf("targets is required")
+	}
+	if len(request.Targets) > maxBatchTargets {
+		return BatchProbeResponse{}, fmt.Errorf("targets supports at most %d entries", maxBatchTargets)
+	}
+
+	normalized := make([]ProbeRequest, 0, len(request.Targets))
+	seenTargets := make(map[string]struct{}, len(request.Targets))
+	for index, target := range request.Targets {
+		probe := ProbeRequest{Target: target, NodeIDs: request.NodeIDs, Options: request.Options}
+		if err := service.validateRequest(&probe); err != nil {
+			return BatchProbeResponse{}, fmt.Errorf("targets[%d]: %w", index, err)
+		}
+		if _, exists := seenTargets[probe.Target]; exists {
+			continue
+		}
+		seenTargets[probe.Target] = struct{}{}
+		normalized = append(normalized, probe)
+	}
+
+	nodes, err := service.listNodes(ctx)
+	if err != nil {
+		return BatchProbeResponse{}, fmt.Errorf("registry: %w", err)
+	}
+	nodes = selectNodes(nodes, request.NodeIDs)
+	if len(nodes) == 0 {
+		return BatchProbeResponse{}, ErrNoEligibleNodes
+	}
+	if len(normalized)*len(nodes) > maxBatchNodeChecks {
+		return BatchProbeResponse{}, fmt.Errorf("batch expands to %d node checks; maximum is %d", len(normalized)*len(nodes), maxBatchNodeChecks)
+	}
+
+	started := time.Now().UTC()
+	response := BatchProbeResponse{
+		BatchTaskID: "batch-" + strings.TrimPrefix(newTaskID(), "sa-"),
+		Status:      "running",
+		Progress:    0,
+		StartedAt:   started,
+		ExpiresAt:   started.Add(batchRuntimeLimit),
+		NodeCount:   len(nodes),
+		Summary:     BatchProbeSummary{TotalTargets: len(normalized)},
+		Targets:     make([]BatchTargetSummary, len(normalized)),
+	}
+	for index, probe := range normalized {
+		response.Targets[index] = BatchTargetSummary{Index: index, Target: probe.Target, Status: "pending"}
+	}
+	details := make([]ProbeResponse, len(normalized))
+	if err := service.storeBatch(response, details); err != nil {
+		return BatchProbeResponse{}, err
+	}
+
+	storedResponse := cloneBatchResponse(response)
+	go service.executeBatch(response.BatchTaskID, normalized, nodes)
+	return storedResponse, nil
+}
+
+func (service *service) executeBatch(batchTaskID string, probes []ProbeRequest, nodes []Node) {
+	ctx, cancel := context.WithTimeout(context.Background(), batchRuntimeLimit)
+	defer cancel()
+
+	jobs := make(chan int)
+	workerCount := batchTargetWorkers
+	if workerCount > service.cfg.MaxParallel {
+		workerCount = service.cfg.MaxParallel
+	}
+	if workerCount > len(probes) {
+		workerCount = len(probes)
+	}
+
+	var wg sync.WaitGroup
+	for range workerCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				detail := service.runWithNodes(ctx, probes[index], nodes, newTaskID())
+				service.storeBatchTarget(batchTaskID, index, detail)
+			}
+		}()
+	}
+	for index := range probes {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
+	service.finishBatch(batchTaskID)
+}
+
+func (service *service) storeBatchTarget(batchTaskID string, index int, detail ProbeResponse) {
+	service.batchMu.Lock()
+	defer service.batchMu.Unlock()
+	batch, exists := service.batches[batchTaskID]
+	if !exists || index < 0 || index >= len(batch.details) {
+		return
+	}
+	batch.details[index] = detail
+	status := "completed"
+	if detail.Summary.Completed == 0 {
+		status = "failed"
+		batch.response.Summary.FailedTargets++
+	} else {
+		batch.response.Summary.CompletedTargets++
+	}
+	if detail.Summary.Available > 0 {
+		batch.response.Summary.AvailableTargets++
+	}
+	batch.response.Summary.TotalNodeChecks += detail.Summary.Total
+	batch.response.Summary.AvailableNodeChecks += detail.Summary.Available
+	batch.response.Targets[index] = BatchTargetSummary{
+		Index:      index,
+		TaskID:     detail.TaskID,
+		Target:     detail.Target,
+		Status:     status,
+		DurationMS: detail.DurationMS,
+		Summary:    detail.Summary,
+	}
+	done := batch.response.Summary.CompletedTargets + batch.response.Summary.FailedTargets
+	batch.response.Progress = done * 100 / batch.response.Summary.TotalTargets
+	service.batches[batchTaskID] = batch
+}
+
+func (service *service) finishBatch(batchTaskID string) {
+	service.batchMu.Lock()
+	defer service.batchMu.Unlock()
+	batch, exists := service.batches[batchTaskID]
+	if !exists {
+		return
+	}
+	finished := time.Now().UTC()
+	batch.response.Status = "completed"
+	batch.response.Progress = 100
+	batch.response.FinishedAt = finished
+	batch.response.ExpiresAt = finished.Add(batchResultTTL)
+	batch.response.DurationMS = finished.Sub(batch.response.StartedAt).Milliseconds()
+	service.batches[batchTaskID] = batch
+}
+
+func cloneBatchResponse(response BatchProbeResponse) BatchProbeResponse {
+	response.Targets = append([]BatchTargetSummary(nil), response.Targets...)
+	return response
+}
+
+func (service *service) storeBatch(response BatchProbeResponse, details []ProbeResponse) error {
+	service.batchMu.Lock()
+	defer service.batchMu.Unlock()
+	now := time.Now().UTC()
+	for taskID, batch := range service.batches {
+		if !batch.response.ExpiresAt.After(now) {
+			delete(service.batches, taskID)
+		}
+	}
+	if len(service.batches) >= maxStoredBatches {
+		var oldestID string
+		var oldestFinished time.Time
+		for taskID, batch := range service.batches {
+			if batch.response.Status == "running" {
+				continue
+			}
+			if oldestID == "" || batch.response.FinishedAt.Before(oldestFinished) {
+				oldestID = taskID
+				oldestFinished = batch.response.FinishedAt
+			}
+		}
+		if oldestID == "" {
+			return ErrBatchCapacity
+		}
+		delete(service.batches, oldestID)
+	}
+	response = cloneBatchResponse(response)
+	service.batches[response.BatchTaskID] = storedBatchResult{response: response, details: details}
+	return nil
+}
+
+func (service *service) batchSummary(taskID string) (BatchProbeResponse, error) {
+	service.batchMu.RLock()
+	batch, exists := service.batches[taskID]
+	response := cloneBatchResponse(batch.response)
+	service.batchMu.RUnlock()
+	if !exists || !response.ExpiresAt.After(time.Now().UTC()) {
+		if exists {
+			service.batchMu.Lock()
+			delete(service.batches, taskID)
+			service.batchMu.Unlock()
+		}
+		return BatchProbeResponse{}, ErrBatchNotFound
+	}
 	return response, nil
+}
+
+func (service *service) batchTarget(taskID string, index int) (ProbeResponse, error) {
+	service.batchMu.RLock()
+	batch, exists := service.batches[taskID]
+	if exists && index >= 0 && index < len(batch.details) {
+		detail := batch.details[index]
+		service.batchMu.RUnlock()
+		if !batch.response.ExpiresAt.After(time.Now().UTC()) {
+			service.batchMu.Lock()
+			delete(service.batches, taskID)
+			service.batchMu.Unlock()
+			return ProbeResponse{}, ErrBatchNotFound
+		}
+		if detail.TaskID == "" {
+			return ProbeResponse{}, ErrBatchTarget
+		}
+		return detail, nil
+	}
+	service.batchMu.RUnlock()
+	if !exists || !batch.response.ExpiresAt.After(time.Now().UTC()) {
+		if exists {
+			service.batchMu.Lock()
+			delete(service.batches, taskID)
+			service.batchMu.Unlock()
+		}
+		return ProbeResponse{}, ErrBatchNotFound
+	}
+	if index < 0 || index >= len(batch.details) {
+		return ProbeResponse{}, ErrBatchTarget
+	}
+	return ProbeResponse{}, ErrBatchTarget
 }
 
 func (service *service) validateRequest(request *ProbeRequest) error {
