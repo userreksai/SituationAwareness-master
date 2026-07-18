@@ -80,6 +80,28 @@ lock_deployment() {
   fi
 }
 
+backup_untracked_remote_collisions() {
+  local remote_ref="origin/${BRANCH}"
+  local path
+  local backup_dir=""
+
+  while IFS= read -r -d '' path; do
+    if ! git -C "${SOURCE_DIR}" cat-file -e "${remote_ref}:${path}" 2>/dev/null; then
+      continue
+    fi
+    if [[ -z "${backup_dir}" ]]; then
+      backup_dir="$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}.untracked.XXXXXX")"
+    fi
+    mkdir -p -- "$(dirname -- "${backup_dir}/${path}")"
+    mv -- "${SOURCE_DIR}/${path}" "${backup_dir}/${path}"
+    log "已备份会阻塞更新的未跟踪文件：${path}"
+  done < <(git -C "${SOURCE_DIR}" ls-files --others --exclude-standard -z)
+
+  if [[ -n "${backup_dir}" ]]; then
+    log "未跟踪文件备份目录：${backup_dir}"
+  fi
+}
+
 update_source() {
   if [[ ! -d "${SOURCE_DIR}/.git" ]]; then
     if [[ -e "${SOURCE_DIR}" ]] && [[ -n "$(find "${SOURCE_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
@@ -97,6 +119,7 @@ update_source() {
 
   log "拉取 origin/${BRANCH}"
   git -C "${SOURCE_DIR}" fetch --prune origin "${BRANCH}"
+  backup_untracked_remote_collisions
   git -C "${SOURCE_DIR}" checkout "${BRANCH}"
   git -C "${SOURCE_DIR}" merge --ff-only "origin/${BRANCH}"
   log "当前版本：$(git -C "${SOURCE_DIR}" rev-parse --short HEAD)"
