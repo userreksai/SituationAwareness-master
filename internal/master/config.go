@@ -10,30 +10,34 @@ import (
 )
 
 type Config struct {
-	ListenAddr         string
-	RegistryURL        string
-	AgentPort          int
-	AgentTaskPath      string
-	SharedToken        string
-	MaxParallel        int
-	RegistryTimeout    time.Duration
-	TaskDefaultTimeout time.Duration
-	TaskMaxTimeout     time.Duration
-	AllowedOrigin      string
+	ListenAddr          string
+	RegistryURL         string
+	AgentPort           int
+	AgentTaskPath       string
+	AgentHealthInterval time.Duration
+	AgentHealthTimeout  time.Duration
+	SharedToken         string
+	MaxParallel         int
+	RegistryTimeout     time.Duration
+	TaskDefaultTimeout  time.Duration
+	TaskMaxTimeout      time.Duration
+	AllowedOrigin       string
 }
 
 func LoadConfig() (Config, error) {
 	cfg := Config{
-		ListenAddr:         envOrDefault("MASTER_LISTEN_ADDR", ":8001"),
-		RegistryURL:        envOrDefault("NODE_REGISTRY_URL", "http://127.0.0.1:8888/api/nodes"),
-		AgentPort:          8002,
-		AgentTaskPath:      envOrDefault("AGENT_TASK_PATH", "/api/v1/tasks"),
-		SharedToken:        strings.TrimSpace(os.Getenv("AGENT_SHARED_TOKEN")),
-		MaxParallel:        20,
-		RegistryTimeout:    3 * time.Second,
-		TaskDefaultTimeout: 10 * time.Second,
-		TaskMaxTimeout:     30 * time.Second,
-		AllowedOrigin:      envOrDefault("CORS_ALLOWED_ORIGIN", "*"),
+		ListenAddr:          envOrDefault("MASTER_LISTEN_ADDR", ":8001"),
+		RegistryURL:         envOrDefault("NODE_REGISTRY_URL", "http://127.0.0.1:8888/api/nodes"),
+		AgentPort:           8002,
+		AgentTaskPath:       envOrDefault("AGENT_TASK_PATH", "/api/v1/tasks"),
+		AgentHealthInterval: time.Minute,
+		AgentHealthTimeout:  3 * time.Second,
+		SharedToken:         strings.TrimSpace(os.Getenv("AGENT_SHARED_TOKEN")),
+		MaxParallel:         20,
+		RegistryTimeout:     3 * time.Second,
+		TaskDefaultTimeout:  10 * time.Second,
+		TaskMaxTimeout:      30 * time.Second,
+		AllowedOrigin:       envOrDefault("CORS_ALLOWED_ORIGIN", "*"),
 	}
 
 	var err error
@@ -45,6 +49,18 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.RegistryTimeout, err = durationEnv("REGISTRY_TIMEOUT", cfg.RegistryTimeout); err != nil {
 		return Config{}, err
+	}
+	if cfg.AgentHealthInterval, err = durationEnv("AGENT_HEALTH_INTERVAL", cfg.AgentHealthInterval); err != nil {
+		return Config{}, err
+	}
+	if cfg.AgentHealthTimeout, err = durationEnv("AGENT_HEALTH_TIMEOUT", cfg.AgentHealthTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.AgentHealthInterval < 5*time.Second {
+		return Config{}, fmt.Errorf("AGENT_HEALTH_INTERVAL must be at least 5s")
+	}
+	if cfg.AgentHealthTimeout < 100*time.Millisecond || cfg.AgentHealthTimeout > cfg.AgentHealthInterval {
+		return Config{}, fmt.Errorf("AGENT_HEALTH_TIMEOUT must be between 100ms and AGENT_HEALTH_INTERVAL")
 	}
 	if cfg.TaskDefaultTimeout, err = durationEnv("TASK_DEFAULT_TIMEOUT", cfg.TaskDefaultTimeout); err != nil {
 		return Config{}, err

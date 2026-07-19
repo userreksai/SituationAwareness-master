@@ -40,15 +40,29 @@ type storedBatchResult struct {
 }
 
 type service struct {
-	cfg       Config
-	registry  *registryClient
-	agentHTTP *http.Client
-	semaphore chan struct{}
-	batchMu   sync.RWMutex
-	batches   map[string]storedBatchResult
+	cfg             Config
+	registry        *registryClient
+	agentHTTP       *http.Client
+	semaphore       chan struct{}
+	healthSemaphore chan struct{}
+	healthRefreshMu sync.Mutex
+	healthMu        sync.RWMutex
+	nodeHealth      map[string]agentHealthSnapshot
+	batchMu         sync.RWMutex
+	batches         map[string]storedBatchResult
 }
 
 func newService(cfg Config) *service {
+	if cfg.AgentHealthInterval <= 0 {
+		cfg.AgentHealthInterval = time.Minute
+	}
+	if cfg.AgentHealthTimeout <= 0 {
+		cfg.AgentHealthTimeout = 3 * time.Second
+	}
+	healthParallel := cfg.MaxParallel
+	if healthParallel > 20 {
+		healthParallel = 20
+	}
 	transport := &http.Transport{
 		Proxy:               nil,
 		DialContext:         (&net.Dialer{}).DialContext,
@@ -59,11 +73,13 @@ func newService(cfg Config) *service {
 		TLSHandshakeTimeout: 5 * time.Second,
 	}
 	return &service{
-		cfg:       cfg,
-		registry:  newRegistryClient(cfg),
-		agentHTTP: &http.Client{Transport: transport},
-		semaphore: make(chan struct{}, cfg.MaxParallel),
-		batches:   make(map[string]storedBatchResult),
+		cfg:             cfg,
+		registry:        newRegistryClient(cfg),
+		agentHTTP:       &http.Client{Transport: transport},
+		semaphore:       make(chan struct{}, cfg.MaxParallel),
+		healthSemaphore: make(chan struct{}, healthParallel),
+		nodeHealth:      make(map[string]agentHealthSnapshot),
+		batches:         make(map[string]storedBatchResult),
 	}
 }
 
@@ -72,7 +88,9 @@ func (service *service) listNodes(ctx context.Context) ([]Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return eligibleNodes(nodes, service.cfg.AgentPort), nil
+	nodes = eligibleNodes(nodes, service.cfg.AgentPort)
+	service.refreshNodeHealth(ctx, nodes, false)
+	return service.applyNodeHealth(nodes), nil
 }
 
 func (service *service) run(ctx context.Context, request ProbeRequest) (ProbeResponse, error) {
@@ -84,6 +102,7 @@ func (service *service) run(ctx context.Context, request ProbeRequest) (ProbeRes
 		return ProbeResponse{}, fmt.Errorf("registry: %w", err)
 	}
 	nodes = selectNodes(nodes, request.NodeIDs)
+	nodes = onlineNodes(nodes)
 	if len(nodes) == 0 {
 		return ProbeResponse{}, ErrNoEligibleNodes
 	}
@@ -160,6 +179,7 @@ func (service *service) startBatch(ctx context.Context, request BatchProbeReques
 		return BatchProbeResponse{}, fmt.Errorf("registry: %w", err)
 	}
 	nodes = selectNodes(nodes, request.NodeIDs)
+	nodes = onlineNodes(nodes)
 	if len(nodes) == 0 {
 		return BatchProbeResponse{}, ErrNoEligibleNodes
 	}

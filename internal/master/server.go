@@ -1,6 +1,7 @@
 package master
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,10 +20,20 @@ type apiHandler struct {
 }
 
 func NewHandler(cfg Config, logger *log.Logger) http.Handler {
+	return newAPIHandler(cfg, logger, newService(cfg))
+}
+
+func NewMonitoredHandler(ctx context.Context, cfg Config, logger *log.Logger) http.Handler {
+	service := newService(cfg)
+	service.startNodeHealthMonitor(ctx, logger)
+	return newAPIHandler(cfg, logger, service)
+}
+
+func newAPIHandler(cfg Config, logger *log.Logger, service *service) http.Handler {
 	if logger == nil {
 		logger = log.Default()
 	}
-	handler := &apiHandler{cfg: cfg, logger: logger, service: newService(cfg)}
+	handler := &apiHandler{cfg: cfg, logger: logger, service: service}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handler.health)
 	mux.HandleFunc("GET /api/v1/health", handler.health)
@@ -50,10 +61,18 @@ func (handler *apiHandler) nodes(w http.ResponseWriter, request *http.Request) {
 		writeAPIError(w, http.StatusBadGateway, "registry_unavailable", err.Error())
 		return
 	}
+	onlineCount := 0
+	for _, node := range nodes {
+		if node.HealthStatus == "online" {
+			onlineCount++
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"nodes":     nodes,
-		"count":     len(nodes),
-		"fetchedAt": time.Now().UTC(),
+		"nodes":                 nodes,
+		"count":                 onlineCount,
+		"totalCount":            len(nodes),
+		"healthIntervalSeconds": int(handler.cfg.AgentHealthInterval / time.Second),
+		"fetchedAt":             time.Now().UTC(),
 	})
 }
 
