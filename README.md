@@ -6,9 +6,10 @@
 
 1. Web 调用 `POST /api/v1/probes` 提交目标地址。
 2. Master 请求 `http://127.0.0.1:8888/api/nodes`。
-3. 只保留 `status=enabled`、`port=8002` 且 IP 合法的节点；注册中心中的 8001 主控节点会自动忽略。
-4. Master 并发调用 `http://节点IP:8002/api/v1/tasks`。
-5. Master 汇总每个 Agent 的 DNS、TCP、HTTP 结果并返回 Web。
+3. 只保留 `status=enabled`、`port=8002` 且 IP 合法的节点，并每分钟请求 Agent 的 `/healthz`。
+4. 只有健康状态为 `online` 的 Agent 才会参与任务调度；进程停止或网络中断的节点会标记为 `offline`。
+5. Master 并发调用 `http://节点IP:8002/api/v1/tasks`。
+6. Master 汇总每个 Agent 的 DNS、TCP、HTTP 结果并返回 Web。
 
 ## 快速启动
 
@@ -34,6 +35,8 @@ curl -X POST http://127.0.0.1:8001/api/v1/probes \
 | `NODE_REGISTRY_URL` | `http://127.0.0.1:8888/api/nodes` | 节点注册中心列表接口 |
 | `AGENT_PORT` | `8002` | 允许调度的 Agent 端口，同时用于排除主控节点 |
 | `AGENT_TASK_PATH` | `/api/v1/tasks` | Agent 任务接口路径 |
+| `AGENT_HEALTH_INTERVAL` | `1m` | Agent 健康检查周期；Master 启动时会立即检查一次 |
+| `AGENT_HEALTH_TIMEOUT` | `3s` | 单个 Agent `/healthz` 请求超时 |
 | `AGENT_SHARED_TOKEN` | 空 | 发送给 Agent 的 Bearer 令牌；生产环境必须设置 |
 | `MASTER_MAX_PARALLEL` | `20` | 整个 Master 同时向 Agent 发出的最大请求数 |
 | `REGISTRY_TIMEOUT` | `3s` | 注册中心请求超时 |
@@ -68,7 +71,7 @@ curl -X POST http://127.0.0.1:8001/api/v1/probes \
 
 ### `GET /api/v1/nodes`
 
-返回当前可调度 Agent。返回内容已经排除了禁用、维护、非 8002 以及无效 IP 的记录。
+返回注册中心中符合基本条件的 Agent，并附带 `healthStatus`、`healthCheckedAt`、`healthLatencyMs` 和可选的 `healthError`。`count` 表示当前在线且可调度的节点数，`totalCount` 表示返回的节点总数。离线节点仍会返回供前端展示，但不会参与任务调度。
 
 ### `POST /api/v1/probes`
 

@@ -22,10 +22,12 @@ func main() {
 	if cfg.SharedToken == "" {
 		logger.Printf("WARNING: AGENT_SHARED_TOKEN is empty; Agent calls are not authenticated")
 	}
+	healthCtx, stopHealthMonitor := context.WithCancel(context.Background())
+	defer stopHealthMonitor()
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           master.NewHandler(cfg, logger),
+		Handler:           master.NewMonitoredHandler(healthCtx, cfg, logger),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       cfg.TaskMaxTimeout + 10*time.Second,
 		WriteTimeout:      cfg.TaskMaxTimeout + 15*time.Second,
@@ -49,6 +51,7 @@ func main() {
 		}
 		return
 	}
+	stopHealthMonitor()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

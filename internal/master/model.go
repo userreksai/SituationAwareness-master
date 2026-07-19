@@ -3,18 +3,22 @@ package master
 import "time"
 
 type Node struct {
-	ID         string     `json:"id"`
-	IP         string     `json:"ip"`
-	Province   string     `json:"province"`
-	City       string     `json:"city"`
-	ISP        string     `json:"isp"`
-	AgentName  string     `json:"agentName"`
-	Port       int        `json:"port"`
-	Status     string     `json:"status"`
-	Remark     string     `json:"remark"`
-	CreatedAt  *time.Time `json:"createdAt,omitempty"`
-	UpdatedAt  *time.Time `json:"updatedAt,omitempty"`
-	LastSeenAt *time.Time `json:"lastSeenAt,omitempty"`
+	ID              string     `json:"id"`
+	IP              string     `json:"ip"`
+	Province        string     `json:"province"`
+	City            string     `json:"city"`
+	ISP             string     `json:"isp"`
+	AgentName       string     `json:"agentName"`
+	Port            int        `json:"port"`
+	Status          string     `json:"status"`
+	HealthStatus    string     `json:"healthStatus"`
+	HealthCheckedAt *time.Time `json:"healthCheckedAt,omitempty"`
+	HealthLatencyMS int64      `json:"healthLatencyMs,omitempty"`
+	HealthError     string     `json:"healthError,omitempty"`
+	Remark          string     `json:"remark"`
+	CreatedAt       *time.Time `json:"createdAt,omitempty"`
+	UpdatedAt       *time.Time `json:"updatedAt,omitempty"`
+	LastSeenAt      *time.Time `json:"lastSeenAt,omitempty"`
 }
 
 type ProbeOptions struct {

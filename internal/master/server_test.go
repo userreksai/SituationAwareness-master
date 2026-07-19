@@ -2,6 +2,7 @@ package master
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,21 +12,24 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func baseTestConfig() Config {
 	return Config{
-		ListenAddr:         ":8001",
-		AgentPort:          8002,
-		AgentTaskPath:      "/api/v1/tasks",
-		SharedToken:        "shared-test-token",
-		MaxParallel:        4,
-		RegistryTimeout:    2 * time.Second,
-		TaskDefaultTimeout: 2 * time.Second,
-		TaskMaxTimeout:     5 * time.Second,
-		AllowedOrigin:      "*",
+		ListenAddr:          ":8001",
+		AgentPort:           8002,
+		AgentTaskPath:       "/api/v1/tasks",
+		AgentHealthInterval: time.Minute,
+		AgentHealthTimeout:  200 * time.Millisecond,
+		SharedToken:         "shared-test-token",
+		MaxParallel:         4,
+		RegistryTimeout:     2 * time.Second,
+		TaskDefaultTimeout:  2 * time.Second,
+		TaskMaxTimeout:      5 * time.Second,
+		AllowedOrigin:       "*",
 	}
 }
 
@@ -58,11 +62,18 @@ func TestNodesFiltersMasterAndDisabledEntries(t *testing.T) {
 	if len(payload.Nodes) != 1 || payload.Nodes[0].ID != "agent" {
 		t.Fatalf("unexpected eligible nodes: %+v", payload.Nodes)
 	}
+	if payload.Nodes[0].HealthStatus != "offline" || payload.Nodes[0].HealthCheckedAt == nil {
+		t.Fatalf("unexpected node health: %+v", payload.Nodes[0])
+	}
 }
 
 func TestProbeDispatchesAndAggregates(t *testing.T) {
 	t.Parallel()
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/healthz" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "service": "situation-awareness-agent"})
+			return
+		}
 		if request.Header.Get("Authorization") != "Bearer shared-test-token" {
 			t.Errorf("unexpected Authorization header: %q", request.Header.Get("Authorization"))
 		}
@@ -137,6 +148,10 @@ func TestProbeReturnsUnprocessableWhenSelectionDoesNotMatch(t *testing.T) {
 func TestBatchProbeReturnsSummariesAndLazyTargetDetails(t *testing.T) {
 	t.Parallel()
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/healthz" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "service": "situation-awareness-agent"})
+			return
+		}
 		var task AgentTaskRequest
 		if err := json.NewDecoder(request.Body).Decode(&task); err != nil {
 			t.Errorf("decode task: %v", err)
@@ -261,4 +276,127 @@ func TestBatchProbeRejectsMoreThanTwoHundredTargets(t *testing.T) {
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status=%d", response.StatusCode)
 	}
+}
+
+func TestNodesReportsOnlineAndOfflineAgentHealth(t *testing.T) {
+	t.Parallel()
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/healthz" {
+			http.NotFound(w, request)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "service": "situation-awareness-agent"})
+	}))
+	defer agent.Close()
+	agentURL, _ := url.Parse(agent.URL)
+	agentHost, agentPortText, _ := net.SplitHostPort(agentURL.Host)
+	agentPort, _ := strconv.Atoi(agentPortText)
+
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"nodes": []Node{
+			{ID: "online-agent", IP: agentHost, Port: agentPort, Status: "enabled"},
+			{ID: "offline-agent", IP: "127.0.0.2", Port: agentPort, Status: "enabled"},
+		}})
+	}))
+	defer registry.Close()
+
+	cfg := baseTestConfig()
+	cfg.AgentPort = agentPort
+	cfg.RegistryURL = registry.URL
+	server := httptest.NewServer(NewHandler(cfg, log.New(io.Discard, "", 0)))
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/api/v1/nodes")
+	if err != nil {
+		t.Fatalf("GET nodes: %v", err)
+	}
+	defer response.Body.Close()
+	var payload struct {
+		Nodes      []Node `json:"nodes"`
+		Count      int    `json:"count"`
+		TotalCount int    `json:"totalCount"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode nodes: %v", err)
+	}
+	if payload.Count != 1 || payload.TotalCount != 2 || len(payload.Nodes) != 2 {
+		t.Fatalf("unexpected node counts: %+v", payload)
+	}
+	statuses := map[string]string{}
+	for _, node := range payload.Nodes {
+		statuses[node.ID] = node.HealthStatus
+		if node.HealthCheckedAt == nil {
+			t.Fatalf("missing health check time: %+v", node)
+		}
+	}
+	if statuses["online-agent"] != "online" || statuses["offline-agent"] != "offline" {
+		t.Fatalf("unexpected health statuses: %+v", statuses)
+	}
+
+	probePayload, err := json.Marshal(ProbeRequest{
+		Target:  "example.com",
+		NodeIDs: []string{"offline-agent"},
+	})
+	if err != nil {
+		t.Fatalf("encode probe request: %v", err)
+	}
+	probeResponse, err := http.Post(server.URL+"/api/v1/probes", "application/json", bytes.NewReader(probePayload))
+	if err != nil {
+		t.Fatalf("POST probe: %v", err)
+	}
+	defer probeResponse.Body.Close()
+	if probeResponse.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("offline node probe status=%d", probeResponse.StatusCode)
+	}
+}
+
+func TestNodeHealthMonitorRefreshesAgentState(t *testing.T) {
+	var healthy atomic.Bool
+	healthy.Store(true)
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if !healthy.Load() {
+			http.Error(w, "stopped", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "service": "situation-awareness-agent"})
+	}))
+	defer agent.Close()
+	agentURL, _ := url.Parse(agent.URL)
+	agentHost, agentPortText, _ := net.SplitHostPort(agentURL.Host)
+	agentPort, _ := strconv.Atoi(agentPortText)
+
+	healthNode := Node{ID: "agent", IP: agentHost, Port: agentPort, Status: "enabled"}
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"nodes": []Node{healthNode}})
+	}))
+	defer registry.Close()
+	cfg := baseTestConfig()
+	cfg.AgentPort = agentPort
+	cfg.RegistryURL = registry.URL
+	cfg.AgentHealthInterval = 20 * time.Millisecond
+	cfg.AgentHealthTimeout = 100 * time.Millisecond
+	service := newService(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.startNodeHealthMonitor(ctx, log.New(io.Discard, "", 0))
+
+	healthKey := nodeHealthKey(healthNode)
+	waitForHealthStatus(t, service, healthKey, "online")
+	healthy.Store(false)
+	waitForHealthStatus(t, service, healthKey, "offline")
+}
+
+func waitForHealthStatus(t *testing.T, service *service, nodeKey, expected string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		service.healthMu.RLock()
+		status := service.nodeHealth[nodeKey].status
+		service.healthMu.RUnlock()
+		if status == expected {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("node %s did not reach health status %s", nodeKey, expected)
 }
