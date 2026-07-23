@@ -54,6 +54,8 @@ curl -X POST http://127.0.0.1:8001/api/v1/probes \
 
 完整明细保存在 Master 内存中 30 分钟，最多保留最近 10 个批量任务；服务重启后失效。前端因此可以先分页展示轻量汇总，用户展开目标时再加载详细结果。
 
+汇总中的 `failed` 仅表示 Master 未能完成 Agent 调度；`abnormal` 表示 Agent 已返回结果，但 DNS、HTTP 或整体可达性存在异常。批量总览分别通过 `failedNodeChecks` 和 `abnormalNodeChecks` 汇总这两类计数，避免把“调度成功但探测异常”错误显示为 0 次失败。
+
 请求示例：
 
 ```json

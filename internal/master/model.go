@@ -99,6 +99,7 @@ type ProbeSummary struct {
 	Total     int `json:"total"`
 	Completed int `json:"completed"`
 	Failed    int `json:"failed"`
+	Abnormal  int `json:"abnormal"`
 	Available int `json:"available"`
 }
 
@@ -134,6 +135,8 @@ type BatchProbeSummary struct {
 	AvailableTargets    int `json:"availableTargets"`
 	TotalNodeChecks     int `json:"totalNodeChecks"`
 	AvailableNodeChecks int `json:"availableNodeChecks"`
+	AbnormalNodeChecks  int `json:"abnormalNodeChecks"`
+	FailedNodeChecks    int `json:"failedNodeChecks"`
 }
 
 // BatchProbeResponse intentionally contains target-level summaries only.

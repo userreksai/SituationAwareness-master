@@ -83,7 +83,12 @@ func TestProbeDispatchesAndAggregates(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(AgentTaskResponse{
 			Version: "v1", TaskID: task.TaskID, Type: task.Type, Target: task.Target, Status: "completed",
-			Result: ProbeResult{NormalizedTarget: "https://example.com", Available: true, DNS: DNSResult{Addresses: []string{"93.184.216.34"}}},
+			Result: ProbeResult{
+				NormalizedTarget: "https://example.com",
+				Available:        true,
+				DNS:              DNSResult{Addresses: []string{"93.184.216.34"}},
+				HTTP:             []HTTPResult{{StatusCode: http.StatusOK}},
+			},
 		})
 	}))
 	defer agent.Close()
@@ -157,9 +162,18 @@ func TestBatchProbeReturnsSummariesAndLazyTargetDetails(t *testing.T) {
 			t.Errorf("decode task: %v", err)
 		}
 		available := task.Target != "down.example.com"
+		httpResults := []HTTPResult{{Error: "context deadline exceeded"}}
+		if available {
+			httpResults = []HTTPResult{{StatusCode: http.StatusOK}}
+		}
 		_ = json.NewEncoder(w).Encode(AgentTaskResponse{
 			Version: "v1", TaskID: task.TaskID, Type: task.Type, Target: task.Target, Status: "completed",
-			Result: ProbeResult{NormalizedTarget: task.Target, Available: available, DNS: DNSResult{Addresses: []string{"127.0.0.1"}}},
+			Result: ProbeResult{
+				NormalizedTarget: task.Target,
+				Available:        available,
+				DNS:              DNSResult{Addresses: []string{"127.0.0.1"}},
+				HTTP:             httpResults,
+			},
 		})
 	}))
 	defer agent.Close()
@@ -220,11 +234,17 @@ func TestBatchProbeReturnsSummariesAndLazyTargetDetails(t *testing.T) {
 	if batch.Summary.TotalTargets != 2 || batch.Summary.AvailableTargets != 1 || batch.Summary.TotalNodeChecks != 2 {
 		t.Fatalf("unexpected batch summary: %+v", batch.Summary)
 	}
+	if batch.Summary.AbnormalNodeChecks != 1 || batch.Summary.FailedNodeChecks != 0 {
+		t.Fatalf("unexpected batch abnormal counts: %+v", batch.Summary)
+	}
 	if batch.Progress != 100 {
 		t.Fatalf("unexpected completed progress: %d", batch.Progress)
 	}
 	if len(batch.Targets) != 2 || batch.Targets[0].Target != "up.example.com" || batch.Targets[1].Target != "down.example.com" {
 		t.Fatalf("unexpected target summaries: %+v", batch.Targets)
+	}
+	if batch.Targets[0].Summary.Abnormal != 0 || batch.Targets[1].Summary.Abnormal != 1 {
+		t.Fatalf("unexpected target abnormal counts: %+v", batch.Targets)
 	}
 
 	detailResponse, err := http.Get(fmt.Sprintf("%s/api/v1/probes/batch/%s/targets/0", server.URL, batch.BatchTaskID))
@@ -251,6 +271,86 @@ func TestBatchProbeReturnsSummariesAndLazyTargetDetails(t *testing.T) {
 	defer missingResponse.Body.Close()
 	if missingResponse.StatusCode != http.StatusNotFound {
 		t.Fatalf("missing detail status=%d", missingResponse.StatusCode)
+	}
+}
+
+func TestProbeHasAbnormality(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		result ProbeResult
+		want   bool
+	}{
+		{
+			name: "healthy HTTP response",
+			result: ProbeResult{
+				Available: true,
+				DNS:       DNSResult{Addresses: []string{"192.0.2.1"}},
+				HTTP:      []HTTPResult{{StatusCode: http.StatusOK}},
+			},
+		},
+		{
+			name: "HTTP timeout although TCP is reachable",
+			result: ProbeResult{
+				Available: true,
+				DNS:       DNSResult{Addresses: []string{"192.0.2.1"}},
+				TCP:       []TCPResult{{Port: 443, Reachable: true}},
+				HTTP:      []HTTPResult{{Error: "context deadline exceeded"}},
+			},
+			want: true,
+		},
+		{
+			name: "missing HTTP result",
+			result: ProbeResult{
+				Available: true,
+				DNS:       DNSResult{Addresses: []string{"192.0.2.1"}},
+				TCP:       []TCPResult{{Port: 443, Reachable: true}},
+			},
+			want: true,
+		},
+		{
+			name: "DNS timeout alongside HTTP 200",
+			result: ProbeResult{
+				Available: true,
+				DNS:       DNSResult{Error: "lookup example.com: i/o timeout"},
+				HTTP:      []HTTPResult{{StatusCode: http.StatusOK}},
+			},
+			want: true,
+		},
+		{
+			name: "HTTPS fallback fails but HTTP succeeds",
+			result: ProbeResult{
+				Available: true,
+				DNS:       DNSResult{Addresses: []string{"192.0.2.1"}},
+				HTTP: []HTTPResult{
+					{Error: "TLS handshake failed"},
+					{StatusCode: http.StatusOK},
+				},
+			},
+		},
+		{
+			name: "HTTP 500 despite reachable TCP",
+			result: ProbeResult{
+				Available: true,
+				DNS:       DNSResult{Addresses: []string{"192.0.2.1"}},
+				TCP:       []TCPResult{{Port: 443, Reachable: true}},
+				HTTP:      []HTTPResult{{StatusCode: http.StatusInternalServerError}},
+			},
+			want: true,
+		},
+		{
+			name:   "unavailable result",
+			result: ProbeResult{Available: false},
+			want:   true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := probeHasAbnormality(test.result); got != test.want {
+				t.Fatalf("probeHasAbnormality()=%t, want %t", got, test.want)
+			}
+		})
 	}
 }
 

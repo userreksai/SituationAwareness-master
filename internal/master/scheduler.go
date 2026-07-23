@@ -145,11 +145,29 @@ func (service *service) runWithNodes(ctx context.Context, request ProbeRequest, 
 			if result.Response != nil && result.Response.Result.Available {
 				response.Summary.Available++
 			}
+			if result.Response == nil || probeHasAbnormality(result.Response.Result) {
+				response.Summary.Abnormal++
+			}
 		} else {
 			response.Summary.Failed++
 		}
 	}
 	return response
+}
+
+func probeHasAbnormality(result ProbeResult) bool {
+	if strings.TrimSpace(result.DNS.Error) != "" || !result.Available {
+		return true
+	}
+	if len(result.HTTP) == 0 {
+		return true
+	}
+	for _, item := range result.HTTP {
+		if item.StatusCode >= 100 && item.StatusCode < 500 {
+			return false
+		}
+	}
+	return true
 }
 
 func (service *service) startBatch(ctx context.Context, request BatchProbeRequest) (BatchProbeResponse, error) {
@@ -263,6 +281,8 @@ func (service *service) storeBatchTarget(batchTaskID string, index int, detail P
 	}
 	batch.response.Summary.TotalNodeChecks += detail.Summary.Total
 	batch.response.Summary.AvailableNodeChecks += detail.Summary.Available
+	batch.response.Summary.AbnormalNodeChecks += detail.Summary.Abnormal
+	batch.response.Summary.FailedNodeChecks += detail.Summary.Failed
 	batch.response.Targets[index] = BatchTargetSummary{
 		Index:      index,
 		TaskID:     detail.TaskID,
